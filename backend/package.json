@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
+    "dev": "node node_modules/nodemon/bin/nodemon.js src/index.js",
     "migrate": "node src/db/migrate.js",
     "seed": "node seed/seed.js"
   },
