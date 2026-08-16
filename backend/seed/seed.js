@@ -4,23 +4,24 @@ const { Pool } = require('pg');
 
 const baseConfig = { host: process.env.PGHOST, port: process.env.PGPORT, user: process.env.PGUSER, password: process.env.PGPASSWORD };
 const controlPool = new Pool({ ...baseConfig, database: process.env.PGDATABASE });
-const DEMO_TENANT_DB = `${process.env.PGDATABASE}_demo`;
-const tenantPool = new Pool({ ...baseConfig, database: DEMO_TENANT_DB });
+const DEMO_TENANT_SCHEMA = 'tenant_demo';
+const tenantPool = new Pool({ ...baseConfig, database: process.env.PGDATABASE });
 
 async function seed() {
   const control = await controlPool.connect();
   const tenant = await tenantPool.connect();
   try {
     console.log('Seeding...');
+    await tenant.query(`SET search_path TO "${DEMO_TENANT_SCHEMA}", public`);
 
     // ---- Control plane: the demo organization + a platform admin login ----
     // email_domain matches the @company.com addresses seeded below, so logging in
-    // with any of them resolves to this organization's own database (DEMO_TENANT_DB).
+    // with any of them resolves to this organization's own schema (DEMO_TENANT_SCHEMA).
     await control.query(`DELETE FROM organizations WHERE slug = 'growinch-demo-co'`);
     await control.query(
       `INSERT INTO organizations (name, slug, email_domain, db_name, enabled_crm, enabled_hrm, enabled_accounts)
        VALUES ('GrowInch Demo Co','growinch-demo-co','company.com',$1,true,true,true)`,
-      [DEMO_TENANT_DB]
+      [DEMO_TENANT_SCHEMA]
     );
 
     const pwd = await bcrypt.hash('Password123!', 10);

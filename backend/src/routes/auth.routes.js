@@ -33,13 +33,14 @@ router.post('/login', async (req, res) => {
     if (!org) return res.status(401).json({ error: 'Invalid email or password' });
     if (org.status === 'suspended') return res.status(403).json({ error: 'This organization has been suspended. Contact support.' });
 
-    const tenantPool = db.getTenantPool(org.db_name);
-    const result = await tenantPool.query(
-      `SELECT u.*, r.name as role_name, r.can_access_crm, r.can_access_hrm, r.can_access_accounts, r.can_edit
-       FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE email = $1`,
-      [email]
-    );
-    const user = result.rows[0];
+    const user = await db.withSchema(org.db_name, async (client) => {
+      const result = await client.query(
+        `SELECT u.*, r.name as role_name, r.can_access_crm, r.can_access_hrm, r.can_access_accounts, r.can_edit
+         FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE email = $1`,
+        [email]
+      );
+      return result.rows[0];
+    });
     if (!user || !user.is_active) return res.status(401).json({ error: 'Invalid email or password' });
 
     const valid = await bcrypt.compare(password, user.password_hash);
@@ -56,7 +57,7 @@ router.post('/login', async (req, res) => {
     };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
 
-    await tenantPool.query(`UPDATE users SET last_login_at = now() WHERE id = $1`, [user.id]);
+    await db.withSchema(org.db_name, (client) => client.query(`UPDATE users SET last_login_at = now() WHERE id = $1`, [user.id]));
 
     res.json({ token, user: payload });
   } catch (err) {
@@ -72,15 +73,15 @@ router.post('/forgot-password', async (req, res) => {
 
     const org = await resolveOrgByEmail(email);
     if (org && org.status !== 'suspended') {
-      const tenantPool = db.getTenantPool(org.db_name);
-      const result = await tenantPool.query(`SELECT id, name FROM users WHERE email = $1 AND is_active = true`, [email]);
-      if (result.rows.length > 0) {
+      await db.withSchema(org.db_name, async (client) => {
+        const result = await client.query(`SELECT id, name FROM users WHERE email = $1 AND is_active = true`, [email]);
+        if (result.rows.length === 0) return;
         const user = result.rows[0];
         const rawToken = crypto.randomBytes(32).toString('hex');
         const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
         const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-        await tenantPool.query(
+        await client.query(
           `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1,$2,$3)`,
           [user.id, tokenHash, expiresAt]
         );
@@ -91,7 +92,7 @@ router.post('/forgot-password', async (req, res) => {
           subject: 'Reset your GrowInch password',
           html: `<p>Hi ${user.name},</p><p>Click the link below to reset your GrowInch CRM+HRM password. This link expires in 1 hour.</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>If you didn't request this, you can safely ignore this email.</p>`,
         }).catch((err) => console.error('sendMail (forgot-password) failed:', err.message));
-      }
+      });
     }
 
     // Always respond the same way, whether or not the email/company exists, to avoid leaking which emails are registered.
@@ -109,19 +110,22 @@ router.post('/reset-password', async (req, res) => {
 
     const org = await resolveOrgByEmail(email);
     if (!org) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
-    const tenantPool = db.getTenantPool(org.db_name);
 
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const result = await tenantPool.query(
-      `SELECT * FROM password_reset_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now()`,
-      [tokenHash]
-    );
-    if (result.rows.length === 0) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
+    const resetDone = await db.withSchema(org.db_name, async (client) => {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const result = await client.query(
+        `SELECT * FROM password_reset_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now()`,
+        [tokenHash]
+      );
+      if (result.rows.length === 0) return false;
 
-    const record = result.rows[0];
-    const hash = await bcrypt.hash(password, 10);
-    await tenantPool.query(`UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`, [hash, record.user_id]);
-    await tenantPool.query(`UPDATE password_reset_tokens SET used_at = now() WHERE id = $1`, [record.id]);
+      const record = result.rows[0];
+      const hash = await bcrypt.hash(password, 10);
+      await client.query(`UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`, [hash, record.user_id]);
+      await client.query(`UPDATE password_reset_tokens SET used_at = now() WHERE id = $1`, [record.id]);
+      return true;
+    });
+    if (!resetDone) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
 
     res.json({ message: 'Password reset successful. You can now sign in.' });
   } catch (err) {

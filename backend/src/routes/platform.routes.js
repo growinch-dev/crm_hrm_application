@@ -50,7 +50,7 @@ function normalizeDomain(input) {
 }
 
 // Postgres identifiers: lowercase/underscores only, must start with a letter, capped well under the 63-byte limit.
-function dbNameFromSlug(slug) {
+function schemaNameFromSlug(slug) {
   const safe = slug.replace(/-/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 50);
   return `tenant_${safe}`;
 }
@@ -58,8 +58,8 @@ function dbNameFromSlug(slug) {
 router.get('/organizations', async (req, res) => {
   try {
     const result = await db.controlPlanePool.query(`SELECT * FROM organizations ORDER BY created_at DESC`);
-    const existing = await db.controlPlanePool.query(`SELECT datname FROM pg_database`);
-    const existingNames = new Set(existing.rows.map((r) => r.datname));
+    const existing = await db.controlPlanePool.query(`SELECT schema_name FROM information_schema.schemata`);
+    const existingNames = new Set(existing.rows.map((r) => r.schema_name));
     const data = result.rows.map((org) => ({ ...org, db_exists: existingNames.has(org.db_name) }));
     res.json({ data });
   } catch (err) {
@@ -86,37 +86,49 @@ router.post('/organizations', uploadLogo.single('logo'), async (req, res) => {
     let slug = slugify(name);
     const slugTaken = await db.controlPlanePool.query(`SELECT 1 FROM organizations WHERE slug = $1`, [slug]);
     if (slugTaken.rows.length > 0) slug = `${slug}-${Date.now().toString(36)}`;
-    const dbName = dbNameFromSlug(slug);
+    const schemaName = schemaNameFromSlug(slug);
 
-    // CREATE DATABASE cannot run inside a transaction block - must be its own standalone statement.
-    await db.controlPlanePool.query(`CREATE DATABASE "${dbName}"`);
-
-    // Apply the tenant schema, then seed default roles + the first admin login, in the new database.
-    const tenantPool = db.getTenantPool(dbName);
-    await tenantPool.query(TENANT_SCHEMA_SQL);
-
+    // Provision the org's schema, tenant tables, default roles and first admin login
+    // all in one transaction - a failure partway rolls back cleanly instead of leaving
+    // a half-provisioned schema behind.
+    const client = await db.controlPlanePool.connect();
     let adminRoleId = null;
-    for (const r of DEFAULT_ROLES) {
-      const roleResult = await tenantPool.query(
-        `INSERT INTO roles (name, can_access_crm, can_access_hrm, can_access_accounts) VALUES ($1,$2,$3,$4) RETURNING id`,
-        [r.name, r.crm, r.hrm, r.accounts]
-      );
-      if (r.name === 'admin') adminRoleId = roleResult.rows[0].id;
-    }
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schemaName}"`);
+      await client.query(`SET search_path TO "${schemaName}", public`);
+      await client.query(TENANT_SCHEMA_SQL);
 
-    const hash = await bcrypt.hash(admin_password, 10);
-    await tenantPool.query(
-      `INSERT INTO users (name, email, password_hash, role_id) VALUES ($1,$2,$3,$4)`,
-      [admin_name, admin_email, hash, adminRoleId]
-    );
+      for (const r of DEFAULT_ROLES) {
+        const roleResult = await client.query(
+          `INSERT INTO roles (name, can_access_crm, can_access_hrm, can_access_accounts) VALUES ($1,$2,$3,$4) RETURNING id`,
+          [r.name, r.crm, r.hrm, r.accounts]
+        );
+        if (r.name === 'admin') adminRoleId = roleResult.rows[0].id;
+      }
+
+      const hash = await bcrypt.hash(admin_password, 10);
+      await client.query(
+        `INSERT INTO users (name, email, password_hash, role_id) VALUES ($1,$2,$3,$4)`,
+        [admin_name, admin_email, hash, adminRoleId]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      await client.query('SET search_path TO public').catch(() => {});
+      client.release();
+    }
 
     const logoPath = req.file ? `/uploads/${req.file.filename}` : null;
 
-    // Only register the organization once its database is fully provisioned and seeded.
+    // Only register the organization once its schema is fully provisioned and seeded.
     const orgResult = await db.controlPlanePool.query(
       `INSERT INTO organizations (name, slug, email_domain, db_name, enabled_crm, enabled_hrm, enabled_accounts, logo_path)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [name, slug, domain, dbName, enabled_crm, enabled_hrm, enabled_accounts, logoPath]
+      [name, slug, domain, schemaName, enabled_crm, enabled_hrm, enabled_accounts, logoPath]
     );
 
     res.status(201).json(orgResult.rows[0]);
@@ -163,24 +175,34 @@ router.put('/organizations/:id', uploadLogo.single('logo'), async (req, res) => 
   }
 });
 
-// Removes the organization record and, if its database still exists, drops it too
-// (also cleans up rows left behind if the database was ever deleted out-of-band).
+// Removes the organization record and, if its schema still exists, drops it too
+// (also cleans up rows left behind if the schema was ever deleted out-of-band).
 router.delete('/organizations/:id', async (req, res) => {
+  const client = await db.controlPlanePool.connect();
   try {
-    const orgResult = await db.controlPlanePool.query(`SELECT * FROM organizations WHERE id = $1`, [req.params.id]);
+    await client.query('BEGIN');
+
+    const orgResult = await client.query(`SELECT * FROM organizations WHERE id = $1`, [req.params.id]);
     const org = orgResult.rows[0];
-    if (!org) return res.status(404).json({ error: 'Organization not found' });
-
-    await db.controlPlanePool.query(`DELETE FROM organizations WHERE id = $1`, [req.params.id]);
-
-    const dbExists = await db.controlPlanePool.query(`SELECT 1 FROM pg_database WHERE datname = $1`, [org.db_name]);
-    if (dbExists.rows.length > 0) {
-      await db.controlPlanePool.query(`DROP DATABASE "${org.db_name}"`);
+    if (!org) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Organization not found' });
     }
 
+    await client.query(`DELETE FROM organizations WHERE id = $1`, [req.params.id]);
+
+    const schemaExists = await client.query(`SELECT 1 FROM information_schema.schemata WHERE schema_name = $1`, [org.db_name]);
+    if (schemaExists.rows.length > 0) {
+      await client.query(`DROP SCHEMA "${org.db_name}" CASCADE`);
+    }
+
+    await client.query('COMMIT');
     res.json({ success: true, id: org.id });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     res.status(400).json({ error: 'Failed to delete organization', detail: err.message });
+  } finally {
+    client.release();
   }
 });
 

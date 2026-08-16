@@ -1,13 +1,12 @@
 -- =========================================================================
 -- CRM + HRM  |  PostgreSQL TENANT schema
--- Applied once per company database (see migrations/control-plane-schema.sql
--- for the separate, single platform-wide database that tracks which company
--- owns which database and routes logins to it).
+-- Applied once per company, into its own Postgres schema within the shared
+-- database (see migrations/control-plane-schema.sql for the "public" schema
+-- of that same database, which tracks which company owns which schema and
+-- routes logins to it). Caller must CREATE SCHEMA and SET search_path to it
+-- before running this file - every CREATE TABLE below is unqualified.
 -- =========================================================================
-DROP SCHEMA IF EXISTS public CASCADE;
-CREATE SCHEMA public;
-
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;
 
 -- =========================================================================
 -- CORE / AUTH  (shared by CRM + HRM)
